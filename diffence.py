@@ -23,13 +23,13 @@ if DEVICE == "cuda":
 
 # @markdown ### 選擇資料集 (Select Dataset)
 # @markdown 注意：CelebA 可能需要手動上傳資料，建議先測試 CIFAR-10。
-DATASET_NAME = "CIFAR-10" # @param ["CIFAR-10", "CIFAR-100", "SVHN"]
+DATASET_NAME = "CIFAR-100" # @param ["CIFAR-10", "CIFAR-100", "SVHN"]
 
 # @markdown ### 實驗參數 (Parameters)
-EVAL_SIZE = 200          # @param {type:"integer"} 最終畫圖用的樣本數 (為了速度設為 1000，可改大)
-CALIBRATION_SIZE = 100    # @param {type:"integer"} 校準用的樣本數
-EPOCHS = 10                # @param {type:"integer"} Target Model 訓練次數 (為了演示設為 5，論文建議更多)
-N_RECONSTRUCTIONS = 200    # @param {type:"integer"} 每張圖重建次數
+EVAL_SIZE = 1000          # @param {type:"integer"} 最終畫圖用的樣本數 (為了速度設為 1000，可改大)
+CALIBRATION_SIZE = 1000    # @param {type:"integer"} 校準用的樣本數
+EPOCHS = 30                # @param {type:"integer"} Target Model 訓練次數 (為了演示設為 5，論文建議更多)
+N_RECONSTRUCTIONS = 20    # @param {type:"integer"} 每張圖重建次數
 T_STEPS = 160             # @param {type:"integer"} 擴散步數 (T)
 BATCH_SIZE = 128
 
@@ -86,14 +86,15 @@ def get_diffusion_model():
 # ==========================================
 # 3. 訓練 Target Model
 # ==========================================
-def train_target_model(model, loader, epochs):
+def train_target_model(model, loader, test_loader, epochs): # 多傳入 test_loader
     print(f"開始訓練 Target Model (共 {epochs} epochs)...")
     model.train()
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-6) 
 
     for epoch in range(epochs):
+        model.train()
         total_loss, correct, total = 0, 0, 0
         for inputs, labels in tqdm(loader, desc=f"Epoch {epoch+1}", leave=False):
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
@@ -107,8 +108,24 @@ def train_target_model(model, loader, epochs):
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
-        scheduler.step()
-        print(f"Epoch {epoch+1}: Loss {total_loss/len(loader):.4f} | Acc {100.*correct/total:.2f}%")
+        
+        train_acc = 100.*correct/total
+        
+        # 計算 Test Accuracy (簡單抽樣或完整計算)
+        model.eval()
+        test_correct = 0
+        test_total = 0
+        with torch.no_grad():
+            for inputs, labels in test_loader: # 假設這是 non_mem_loader
+                inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                outputs = model(inputs)
+                _, predicted = outputs.max(1)
+                test_total += labels.size(0)
+                test_correct += predicted.eq(labels).sum().item()
+        test_acc = 100.*test_correct/test_total
+        
+        print(f"Epoch {epoch+1}: Loss {total_loss/len(loader):.4f} | Train Acc {train_acc:.2f}% | Test Acc {test_acc:.2f}%")
+        
     return model
 
 # ==========================================
@@ -119,10 +136,17 @@ def calculate_logit(model, x):
     with torch.no_grad():
         outputs = model(x)
         probs = torch.softmax(outputs, dim=1)
-        max_conf, _ = torch.max(probs, dim=1)     #改過的地方，嘗試不用softmax---------------------------------------------
-        max_conf = torch.clamp(max_conf, 1e-6, 1 - 1e-6)
+        max_conf, _ = torch.max(probs, dim=1)
+        
+        # 轉型為 double (float64) 以支援極高信心度
+        max_conf = max_conf.double()
+        
+        # 使用論文級別的 epsilon
+        epsilon = 1e-15
+        max_conf = torch.clamp(max_conf, epsilon, 1.0 - epsilon)
         logits = torch.log(max_conf / (1 - max_conf))
     return logits
+
 
 def diffusion_reconstruct(pipeline, x, n_recons, t_steps):
     # x: [1, C, H, W] -> Output: [1, N, C, H, W]
@@ -224,7 +248,7 @@ def calibrate_scenario_1(target_model, pipeline, mem_loader, non_mem_loader):
             if len(sel_m) < 10 or len(sel_n) < 10: continue
 
             # 計算 JS Divergence
-            bins = np.linspace(min_v, max_v, 50)
+            bins = np.linspace(min_v, max_v, 100)
             h_m, _ = np.histogram(sel_m, bins=bins, density=True)
             h_n, _ = np.histogram(sel_n, bins=bins, density=True)
             js = jensenshannon(h_m + 1e-10, h_n + 1e-10)
@@ -259,16 +283,21 @@ def run_inference(loader, label, limit):
         return logits
 
 def calculate_logit_undefended(model, x):
-        model.eval()
-        with torch.no_grad():
-            outputs = model(x)
-            probs = torch.softmax(outputs, dim=1)
-            max_conf, _ = torch.max(probs, dim=1)     #嘗試不用softmax-----------------------------------
-            # 避免 log(0)
-            max_conf = torch.clamp(max_conf, 1e-6, 1 - 1e-6)
-            logits = torch.log(max_conf / (1 - max_conf))
+    model.eval()
+    with torch.no_grad():
+        outputs = model(x)
+        probs = torch.softmax(outputs, dim=1)
+        max_conf, _ = torch.max(probs, dim=1)
+        
+        # 轉型為 double (float64) 以支援極高信心度
+        max_conf = max_conf.double()
+        
+        # 使用論文級別的 epsilon
+        epsilon = 1e-15
+        max_conf = torch.clamp(max_conf, epsilon, 1.0 - epsilon)
+        logits = torch.log(max_conf / (1 - max_conf))
 
-        return logits.cpu().item()
+    return logits.cpu().item()
 
 def run_undefended_inference(model, loader, label, limit):
         logits = []
@@ -290,7 +319,10 @@ if __name__ == "__main__":
     print(f"環境設定完成。使用裝置: {DEVICE}")
     # A. 準備資料與模型
     mem_set, non_mem_set, num_classes = get_dataset(DATASET_NAME)
+    monitor_loader = torch.utils.data.DataLoader(non_mem_set, batch_size=BATCH_SIZE, shuffle=False)
     train_loader = torch.utils.data.DataLoader(mem_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+    
+
     # 評估用 Loader (Batch Size 1 以方便擴散重建)
     mem_loader_eval = torch.utils.data.DataLoader(mem_set, batch_size=1, shuffle=True)
     non_mem_loader_eval = torch.utils.data.DataLoader(non_mem_set, batch_size=1, shuffle=True)
@@ -299,7 +331,8 @@ if __name__ == "__main__":
     diffusion_pipeline = get_diffusion_model()
 
     # B. 訓練 Target Model
-    target_model = train_target_model(target_model, train_loader, epochs=EPOCHS)
+    #target_model = train_target_model(target_model, train_loader, epochs=EPOCHS)
+    target_model = train_target_model(target_model, train_loader, monitor_loader, epochs=EPOCHS)
 
     # C. 校準
     interval = calibrate_scenario_1(target_model, diffusion_pipeline, mem_loader_eval, non_mem_loader_eval)
@@ -352,4 +385,3 @@ if __name__ == "__main__":
     print(f"圖片已儲存至: {save_path}")
 
     plt.show()
-
